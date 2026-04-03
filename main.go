@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/elastic/go-elasticsearch/v8"
@@ -34,6 +37,33 @@ type ChangeEvent struct {
 	FullDocument map[string]interface{} `bson:"fullDocument"`
 }
 
+// LogBuffer captures logs in memory securely and allows them to be read as a string.
+type LogBuffer struct {
+	mu    sync.Mutex
+	lines []string
+	max   int
+}
+
+// Write adheres to the io.Writer interface, buffering logs in-memory.
+func (b *LogBuffer) Write(p []byte) (n int, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.lines = append(b.lines, string(p))
+	if len(b.lines) > b.max {
+		b.lines = b.lines[len(b.lines)-b.max:]
+	}
+
+	return len(p), nil
+}
+
+// String returns the recent logs as a single string block.
+func (b *LogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Join(b.lines, "")
+}
+
 func main() {
 	// --- Configuration Setup ---
 	// Load environment variables with fallback defaults for local development.
@@ -48,6 +78,24 @@ func main() {
 
 	// Create a context that can be canceled for graceful application shutdown.
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// --- Local Web Server for Logs ---
+	logBuf := &LogBuffer{max: 1000} // Keep the last 1000 log lines
+	// Write standard logs to both the console and our memory buffer
+	log.SetOutput(io.MultiWriter(os.Stdout, logBuf))
+
+	// Serve the logs at the root HTTP path
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte(logBuf.String()))
+	})
+
+	go func() {
+		log.Println("Starting HTTP server on :8080 to serve logs")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
 
 	// --- Graceful Shutdown Handler ---
 	// Listen for OS interrupt signals (e.g., Ctrl+C) to safely close connections before exiting.
