@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/smtp"
 	"os"
 	"os/signal"
 	"strings"
@@ -74,6 +76,13 @@ func main() {
 	elasticIndex := os.Getenv("MONGO_COLLECTION")
 	elasticAPIKey := os.Getenv("ELASTIC_API_KEY")
 
+	// SMTP settings
+	smtpHost := getEnv("SMTP_HOST", "localhost")
+	smtpPort := getEnv("SMTP_PORT", "25")
+	smtpUser := os.Getenv("SMTP_USER")
+	smtpPass := os.Getenv("SMTP_PASSWORD")
+	smtpFrom := getEnv("SMTP_FROM", "noreply@yagr.local")
+
 	doInitialSync := getEnv("INITIAL_SYNC", "true") == "true"
 
 	// Create a context that can be canceled for graceful application shutdown.
@@ -120,6 +129,7 @@ func main() {
 	}
 
 	collection := mongoClient.Database(mongoDB).Collection(mongoColl)
+	huntsColl := mongoClient.Database(mongoDB).Collection("hunts")
 
 	// 2. Connect to Elasticsearch
 	log.Println("Connecting to Elasticsearch...")
@@ -179,6 +189,12 @@ func main() {
 				continue
 			}
 
+			// Skip indexing if the property is a draft.
+			if isDraft, ok := doc["isdraft"].(bool); ok && isDraft {
+				log.Printf("Skipping draft property ID %s", docID)
+				continue
+			}
+
 			// Remove the MongoDB '_id' field before sending to ES.
 			// Elasticsearch reserves '_id' strictly for document metadata and throws an error
 			// if it exists inside the JSON body.
@@ -205,6 +221,8 @@ func main() {
 					log.Printf("Elasticsearch error indexing %s: %s", docID, res.String())
 				} else {
 					log.Printf("Successfully synced %s (Type: %s)", docID, event.OperationType)
+					// Trigger automated hunt matching checks
+					go evaluateHuntsForProperty(context.Background(), docID, huntsColl, esClient, elasticIndex, smtpHost, smtpPort, smtpUser, smtpPass, smtpFrom)
 				}
 				res.Body.Close()
 			}
@@ -277,6 +295,11 @@ func performInitialSync(ctx context.Context, collection *mongo.Collection, esCli
 			continue
 		}
 
+		// Skip indexing if the property is a draft.
+		if isDraft, ok := doc["isdraft"].(bool); ok && isDraft {
+			continue
+		}
+
 		docID := ""
 		if id, ok := doc["_id"]; ok {
 			docID = parseID(id)
@@ -329,4 +352,106 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// ExplainResponse reflects the minimal structure of Elasticsearch's Explain API response.
+type ExplainResponse struct {
+	Matched     bool `json:"matched"`
+	Explanation struct {
+		Value float64 `json:"value"`
+	} `json:"explanation"`
+}
+
+// evaluateHuntsForProperty asynchronously iterates over user hunts and evaluations condition matching using _explain
+func evaluateHuntsForProperty(ctx context.Context, docID string, huntsColl *mongo.Collection, esClient *elasticsearch.Client, elasticIndex, smtpHost, smtpPort, smtpUser, smtpPass, smtpFrom string) {
+	cursor, err := huntsColl.Find(ctx, bson.M{})
+	if err != nil {
+		log.Printf("Error querying hunts collection: %v", err)
+		return
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var hunt map[string]interface{}
+		if err := cursor.Decode(&hunt); err != nil {
+			log.Printf("Error decoding hunt: %v", err)
+			continue
+		}
+
+		query, ok := hunt["query"]
+		if !ok {
+			// Some hunt objects might not have an active query
+			continue
+		}
+
+		emailIf, ok := hunt["email"]
+		if !ok {
+			log.Printf("Hunt missing 'email' field for doc _id: %v", hunt["_id"])
+			continue
+		}
+		emailStr := fmt.Sprintf("%v", emailIf)
+
+		explainBody := map[string]interface{}{
+			"query": query,
+		}
+		bodyBytes, err := json.Marshal(explainBody)
+		if err != nil {
+			log.Printf("Error marshaling explain query: %v", err)
+			continue
+		}
+
+		req := esapi.ExplainRequest{
+			Index:      elasticIndex,
+			DocumentID: docID,
+			Body:       bytes.NewReader(bodyBytes),
+		}
+
+		res, err := req.Do(ctx, esClient)
+		if err != nil {
+			log.Printf("Error performing explain API request for hunt: %v", err)
+			continue
+		}
+
+		if res.IsError() {
+			log.Printf("Explain API returned error: %s", res.String())
+			res.Body.Close()
+			continue
+		}
+
+		var explainRes ExplainResponse
+		if err := json.NewDecoder(res.Body).Decode(&explainRes); err != nil {
+			log.Printf("Error decoding explain response: %v", err)
+			res.Body.Close()
+			continue
+		}
+		res.Body.Close()
+
+		// "if the match is above 80% send an email"
+		// Based on discussion placeholder logic (score value > 0.8)
+		if explainRes.Matched && explainRes.Explanation.Value >= 0.8 {
+			log.Printf("Hunt match threshold met (%.2f) for doc %s. Sending email to %s", explainRes.Explanation.Value, docID, emailStr)
+			sendMatchEmail(smtpHost, smtpPort, smtpUser, smtpPass, smtpFrom, emailStr, docID)
+		}
+	}
+}
+
+// sendMatchEmail sends an email utilizing the go net/smtp system.
+func sendMatchEmail(host, port, user, pass, from, to, docID string) {
+	var auth smtp.Auth
+	if user != "" || pass != "" {
+		auth = smtp.PlainAuth("", user, pass, host)
+	}
+
+	msg := []byte("To: " + to + "\r\n" +
+		"Subject: Property Match Notification\r\n" +
+		"\r\n" +
+		"A property matching your criteria has been inserted/updated.\r\nDocument ID: " + docID + "\r\n")
+
+	addr := host + ":" + port
+	err := smtp.SendMail(addr, auth, from, []string{to}, msg)
+	if err != nil {
+		log.Printf("Error sending match email to %s: %v", to, err)
+	} else {
+		log.Printf("Successfully sent match email to %s", to)
+	}
 }
